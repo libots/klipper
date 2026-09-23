@@ -8,18 +8,20 @@
 import logging
 import json
 
+
+LARGE_EXTRUDER_ADJUSTMENT = 5.0
+
+
 class ExcludeObject:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode_move = self.printer.load_object(config, 'gcode_move')
         self.printer.register_event_handler('klippy:connect',
-                                        self._handle_connect)
+                                            self._handle_connect)
         self.printer.register_event_handler("virtual_sdcard:reset_file",
                                             self._reset_file)
         self.next_transform = None
-        self.last_position_extruded = [0., 0., 0., 0.]
-        self.last_position_excluded = [0., 0., 0., 0.]
 
         self._reset_state()
         self.gcode.register_command(
@@ -40,21 +42,24 @@ class ExcludeObject:
             tuning_tower = self.printer.lookup_object('tuning_tower')
             if tuning_tower.is_active():
                 logging.info('The ExcludeObject move transform is not being '
-                    'loaded due to Tuning tower being Active')
+                             'loaded due to Tuning tower being Active')
                 return
 
-            self.next_transform = self.gcode_move.set_move_transform(self,
-                                                                     force=True)
-            self.extrusion_offsets = {}
-            self.max_position_extruded = 0
-            self.max_position_excluded = 0
-            self.extruder_adj = 0
+            self.next_transform = self.gcode_move.set_move_transform(
+                self, force=True)
+            # XYZ belongs to the one physical carriage. E history belongs to
+            # the active extruder; sharing its maxima and pending adjustment
+            # across ACTIVATE_EXTRUDER is capable of turning an XY travel into
+            # a very large extrusion.
+            self.xyz_offset = [0., 0., 0.]
+            self.physical_xyz = None
+            self.last_excluded_xyz = [0., 0., 0.]
+            self.e_states = {}
+            self.active_extruder = None
             self.initial_extrusion_moves = 5
             self.last_position = [0., 0., 0., 0.]
 
             self.get_position()
-            self.last_position_extruded[:] = self.last_position
-            self.last_position_excluded[:] = self.last_position
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -64,8 +69,8 @@ class ExcludeObject:
             tuning_tower = self.printer.lookup_object('tuning_tower')
             if tuning_tower.is_active():
                 logging.error('The Exclude Object move transform was not '
-                    'unregistered because it is not at the head of the '
-                    'transform chain.')
+                              'unregistered because it is not at the head of '
+                              'the transform chain.')
                 return
 
             self.gcode_move.set_move_transform(self.next_transform, force=True)
@@ -76,121 +81,194 @@ class ExcludeObject:
         self.objects = []
         self.excluded_objects = []
         self.current_object = None
-        self.in_excluded_region = False
 
     def _reset_file(self):
         self._reset_state()
         self._unregister_transform()
 
-    def _get_extrusion_offsets(self):
-        offset = self.extrusion_offsets.get(
-            self.toolhead.get_extruder().get_name())
-        if offset is None:
-            offset = [0., 0., 0., 0.]
-            self.extrusion_offsets[self.toolhead.get_extruder().get_name()] = \
-                offset
-        return offset
+    def _extruder_name(self):
+        return self.toolhead.get_extruder().get_name()
+
+    @staticmethod
+    def _new_e_state(e_position):
+        # Seed every value from the selected extruder's real position, not
+        # zero. A non-zero or negative E origin must not manufacture a
+        # retraction difference on the first excluded region.
+        return {
+            'offset': 0.,
+            'last_virtual': e_position,
+            'last_normal': e_position,
+            'max_normal': e_position,
+            'last_excluded': e_position,
+            'max_excluded': e_position,
+            'pending_adjustment': 0.,
+            'was_ignored': False,
+            'last_excluded_object': None,
+        }
+
+    @staticmethod
+    def _state_log(state):
+        return ('offset=%.6f last=%.6f normal=%.6f/%.6f '
+                'excluded=%.6f/%.6f pending=%.6f ignored=%s'
+                % (state['offset'], state['last_virtual'],
+                   state['last_normal'], state['max_normal'],
+                   state['last_excluded'], state['max_excluded'],
+                   state['pending_adjustment'], state['was_ignored']))
+
+    def _select_e_state(self, physical_e):
+        ename = self._extruder_name()
+        state = self.e_states.get(ename)
+        new_state = state is None
+        if new_state:
+            state = self._new_e_state(physical_e)
+            self.e_states[ename] = state
+        if ename != self.active_extruder:
+            previous = self.active_extruder or '<none>'
+            self.active_extruder = ename
+            logging.info(
+                "exclude_object: active extruder %s -> %s; physical_e=%.6f;"
+                " %s", previous, ename, physical_e, self._state_log(state))
+            if new_state and self._test_in_excluded_region():
+                logging.warning(
+                    "exclude_object: first observation of %s is inside"
+                    " excluded object %s; using physical E %.6f as a neutral"
+                    " retraction baseline", ename, self.current_object,
+                    physical_e)
+        return state
+
+    def _rebase_spatial_position(self, xyz):
+        if self.physical_xyz is None:
+            self.physical_xyz = list(xyz)
+            self.last_excluded_xyz = [xyz[i] + self.xyz_offset[i]
+                                      for i in range(3)]
+            return
+        # A tool-frame change below this transform changes the coordinates
+        # returned by get_position() without being an exclude-object move.
+        # Shift the comparison anchor with it while retaining the outstanding
+        # virtual-to-physical offset.
+        delta = [xyz[i] - self.physical_xyz[i] for i in range(3)]
+        if any(delta):
+            self.last_excluded_xyz = [self.last_excluded_xyz[i] + delta[i]
+                                      for i in range(3)]
+        self.physical_xyz = list(xyz)
 
     def get_position(self):
-        offset = self._get_extrusion_offsets()
         pos = self.next_transform.get_position()
-        for i in range(4):
-            self.last_position[i] = pos[i] + offset[i]
+        self._rebase_spatial_position(pos[:3])
+        state = self._select_e_state(pos[3])
+        state['last_virtual'] = pos[3] + state['offset']
+        self.last_position = [pos[i] + self.xyz_offset[i] for i in range(3)]
+        self.last_position.append(state['last_virtual'])
         return list(self.last_position)
 
-    def _normal_move(self, newpos, speed):
-        offset = self._get_extrusion_offsets()
+    def _state_for_move(self):
+        ename = self._extruder_name()
+        if ename == self.active_extruder:
+            return self.e_states[ename]
+        # Normally gcode_move calls get_position() from its activation event
+        # before the next move. Select here too so correctness does not depend
+        # on event-handler registration order or on callers doing that reset.
+        pos = self.next_transform.get_position()
+        self._rebase_spatial_position(pos[:3])
+        state = self._select_e_state(pos[3])
+        state['last_virtual'] = pos[3] + state['offset']
+        self.last_position = [pos[i] + self.xyz_offset[i] for i in range(3)]
+        self.last_position.append(state['last_virtual'])
+        return state
 
-        if self.initial_extrusion_moves > 0 and \
-            self.last_position[3] != newpos[3]:
-            # Since the transform is not loaded until there is a request to
-            # exclude an object, the transform needs to track a few extrusions
-            # to get the state of the extruder
+    def _calculate_adjustment(self, state):
+        adjustment = (state['max_excluded'] - state['last_excluded']
+                      - (state['max_normal'] - state['last_normal']))
+        state['pending_adjustment'] = adjustment
+        state['was_ignored'] = False
+        if abs(adjustment) >= LARGE_EXTRUDER_ADJUSTMENT:
+            logging.warning(
+                "exclude_object: large E correction %.6f mm for %s after"
+                " excluded object %s; %s; xyz_offset=%s last_excluded_xyz=%s",
+                adjustment, self.active_extruder,
+                state['last_excluded_object'],
+                self._state_log(state), self.xyz_offset,
+                self.last_excluded_xyz)
+        else:
+            # Keep this at info level: it is the evidence that the skipped
+            # object's E history was reconciled without borrowing another
+            # tool's state.  This is emitted once when leaving an excluded
+            # region, not once per move.
+            logging.info(
+                "exclude_object: E correction %.6f mm for %s after excluded"
+                " object %s; %s; xyz_offset=%s last_excluded_xyz=%s",
+                adjustment, self.active_extruder,
+                state['last_excluded_object'], self._state_log(state),
+                self.xyz_offset, self.last_excluded_xyz)
+
+    def _normal_move(self, newpos, speed):
+        state = self._state_for_move()
+        if state['was_ignored']:
+            self._calculate_adjustment(state)
+
+        if (self.initial_extrusion_moves > 0
+                and state['last_virtual'] != newpos[3]):
+            # Preserve upstream's one-time grace after installing the
+            # transform. It is global: restarting it for every tool would
+            # print the first moves of a cancelled object after every switch.
             self.initial_extrusion_moves -= 1
 
-        self.last_position[:] = newpos
-        self.last_position_extruded[:] = self.last_position
-        self.max_position_extruded = max(self.max_position_extruded, newpos[3])
+        if ((self.xyz_offset[0] != 0 or self.xyz_offset[1] != 0)
+                and (newpos[0] != self.last_excluded_xyz[0]
+                     or newpos[1] != self.last_excluded_xyz[1])):
+            self.xyz_offset = [0., 0., 0.]
+            state['offset'] += state['pending_adjustment']
+            state['pending_adjustment'] = 0.
 
-        # These next few conditionals handle the moves immediately after leaving
-        # and excluded object.  The toolhead is at the end of the last printed
-        # object and the gcode is at the end of the last excluded object.
-        #
-        # Ideally, there will be Z and E moves right away to adjust any offsets
-        # before moving away from the last position.  Any remaining corrections
-        # will be made on the firs XY move.
-        if (offset[0] != 0 or offset[1] != 0) and \
-            (newpos[0] != self.last_position_excluded[0] or \
-            newpos[1] != self.last_position_excluded[1]):
-            offset[0] = 0
-            offset[1] = 0
-            offset[2] = 0
-            offset[3] += self.extruder_adj
-            self.extruder_adj = 0
+        if (self.xyz_offset[2] != 0
+                and newpos[2] != self.last_excluded_xyz[2]):
+            self.xyz_offset[2] = 0.
 
-        if offset[2] != 0 and newpos[2] != self.last_position_excluded[2]:
-            offset[2] = 0
+        if (state['pending_adjustment'] != 0
+                and newpos[3] != state['last_excluded']):
+            state['offset'] += state['pending_adjustment']
+            state['pending_adjustment'] = 0.
 
-        if self.extruder_adj != 0 and \
-            newpos[3] != self.last_position_excluded[3]:
-            offset[3] += self.extruder_adj
-            self.extruder_adj = 0
-
-        tx_pos = newpos[:]
-        for i in range(4):
-            tx_pos[i] = newpos[i] - offset[i]
+        tx_pos = [newpos[i] - self.xyz_offset[i] for i in range(3)]
+        tx_pos.append(newpos[3] - state['offset'])
         self.next_transform.move(tx_pos, speed)
 
+        self.physical_xyz = list(tx_pos[:3])
+        state['last_virtual'] = newpos[3]
+        state['last_normal'] = newpos[3]
+        state['max_normal'] = max(state['max_normal'], newpos[3])
+        self.last_position = list(newpos)
+
     def _ignore_move(self, newpos, speed):
-        offset = self._get_extrusion_offsets()
-        for i in range(3):
-            offset[i] = newpos[i] - self.last_position_extruded[i]
-        offset[3] = offset[3] + newpos[3] - self.last_position[3]
-        self.last_position[:] = newpos
-        self.last_position_excluded[:] =self.last_position
-        self.max_position_excluded = max(self.max_position_excluded, newpos[3])
-
-    def _move_into_excluded_region(self, newpos, speed):
-        self.in_excluded_region = True
-        self._ignore_move(newpos, speed)
-
-    def _move_from_excluded_region(self, newpos, speed):
-        self.in_excluded_region = False
-
-        # This adjustment value is used to compensate for any retraction
-        # differences between the last object printed and excluded one.
-        self.extruder_adj = self.max_position_excluded \
-            - self.last_position_excluded[3] \
-            - (self.max_position_extruded - self.last_position_extruded[3])
-        self._normal_move(newpos, speed)
+        state = self._state_for_move()
+        self.xyz_offset = [newpos[i] - self.physical_xyz[i]
+                           for i in range(3)]
+        state['offset'] += newpos[3] - state['last_virtual']
+        state['last_virtual'] = newpos[3]
+        state['last_excluded'] = newpos[3]
+        state['max_excluded'] = max(state['max_excluded'], newpos[3])
+        state['was_ignored'] = True
+        state['last_excluded_object'] = self.current_object
+        self.last_position = list(newpos)
+        self.last_excluded_xyz = list(newpos[:3])
 
     def _test_in_excluded_region(self):
-        # Inside cancelled object
-        return self.current_object in self.excluded_objects \
-            and self.initial_extrusion_moves == 0
+        return (self.current_object in self.excluded_objects
+                and self.initial_extrusion_moves == 0)
 
     def get_status(self, eventtime=None):
-        status = {
+        return {
             "objects": self.objects,
             "excluded_objects": self.excluded_objects,
             "current_object": self.current_object
         }
-        return status
 
     def move(self, newpos, speed):
-        move_in_excluded_region = self._test_in_excluded_region()
         self.last_speed = speed
-
-        if move_in_excluded_region:
-            if self.in_excluded_region:
-                self._ignore_move(newpos, speed)
-            else:
-                self._move_into_excluded_region(newpos, speed)
+        if self._test_in_excluded_region():
+            self._ignore_move(newpos, speed)
         else:
-            if self.in_excluded_region:
-                self._move_from_excluded_region(newpos, speed)
-            else:
-                self._normal_move(newpos, speed)
+            self._normal_move(newpos, speed)
 
     cmd_EXCLUDE_OBJECT_START_help = "Marks the beginning the current object" \
                                     " as labeled"
@@ -224,21 +302,15 @@ class ExcludeObject:
         if reset:
             if name:
                 self._unexclude_object(name)
-
             else:
                 self.excluded_objects = []
-
         elif name:
             if name.upper() not in self.excluded_objects:
                 self._exclude_object(name.upper())
-
         elif current:
             if not self.current_object:
                 raise self.gcode.error('There is no current object to cancel')
-
-            else:
-                self._exclude_object(self.current_object)
-
+            self._exclude_object(self.current_object)
         else:
             self._list_excluded_objects(gcmd)
 
@@ -249,7 +321,6 @@ class ExcludeObject:
 
         if reset:
             self._reset_file()
-
         elif name:
             parameters = gcmd.get_command_parameters().copy()
             parameters.pop('NAME')
@@ -258,15 +329,11 @@ class ExcludeObject:
 
             obj = {"name": name.upper()}
             obj.update(parameters)
-
             if center != None:
                 obj['center'] = json.loads('[%s]' % center)
-
             if polygon != None:
                 obj['polygon'] = json.loads(polygon)
-
             self._add_object_definition(obj)
-
         else:
             self._list_objects(gcmd)
 
@@ -297,6 +364,7 @@ class ExcludeObject:
     def _list_excluded_objects(self, gcmd):
         object_list = " ".join(self.excluded_objects)
         gcmd.respond_info('Excluded objects: {}'.format(object_list))
+
 
 def load_config(config):
     return ExcludeObject(config)
